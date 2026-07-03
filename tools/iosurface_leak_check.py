@@ -9,30 +9,41 @@ Paste into Anki's debug console (Ctrl+Shift+;) on macOS with GPU
 acceleration enabled. Drives mw.moveToState() directly (same path as the
 S key, bypasses any debounce), 40 toggles at 250ms, then reports.
 
-With RECYCLE_PAGES = False this reproduces the leak: every transition is a
-full navigation of mw.web and mw.bottomWeb, and the Chromium GPU compositor
-never returns the IOSurfaces that backed the previous document's layers.
+MODE = "none":
+    Reproduces the leak. Every transition is a full navigation of mw.web
+    and mw.bottomWeb (stdHtml() -> load_url() of a fresh
+    _anki/legacyPageData URL), and the surfaces backing the outgoing
+    document's compositor layers are never released.
 
-With RECYCLE_PAGES = True the QWebEnginePage of both webviews is destroyed
-and recreated before each transition. Destroying the page tears down its
-WebContents and compositor frame sink, which is what actually releases the
-accumulated surfaces. If the IOSurface count stays flat in this mode, the
-surfaces are tied to page lifetime rather than document lifetime,
-confirming the leak sits in QtWebEngine's per-page compositing path.
+MODE = "recycle_page":
+    Destroys and recreates just the QWebEnginePage of mw.web/mw.bottomWeb
+    before each transition, keeping the QWebEngineView itself alive.
+    Confirmed NOT to stop the leak -- the IOSurfaces are not tied to
+    QWebEnginePage/WebContents lifetime.
+
+MODE = "recycle_view":
+    Destroys and recreates the whole QWebEngineView (mw.web / mw.bottomWeb)
+    instead of just its page. This tears down the view's native platform
+    widget along with the page, which is what actually owns the
+    RenderWidgetHostView/DelegatedFrameHost compositor on macOS. If the
+    leak stops here, the IOSurfaces are pooled at the view/compositor
+    level rather than the page level -- i.e. QtWebEngine (or macOS's
+    CALayer/IOSurface backing-store pool underneath it) is caching frames
+    per top-level widget and failing to trim the pool, independent of
+    which WebContents is attached to it.
 """
 
 import os
 import re
 import subprocess
 
-from aqt import colors, mw
-from aqt.theme import theme_manager
-from aqt.webview import AnkiWebPage, AnkiWebView
-from PyQt6.QtCore import QTimer
+from aqt import mw
+from aqt.main import BottomWebView, MainWebView
+from aqt.webview import AnkiWebPage
+from PyQt6.QtCore import QTimer, Qt
 
-# Destroy/recreate the QWebEnginePage of mw.web and mw.bottomWeb before
-# each transition. Toggle to compare leak behaviour with and without.
-RECYCLE_PAGES = True
+# "none" | "recycle_page" | "recycle_view"
+MODE = "recycle_view"
 
 
 def iosurface() -> str:
@@ -48,23 +59,52 @@ def iosurface() -> str:
     return "no IOSurface line found"
 
 
-def recycle_page(web: AnkiWebView) -> None:
+def recycle_page(web) -> None:
     """Destroy the view's QWebEnginePage and install a fresh one.
-
-    Mirrors AnkiWebView.__init__: the new page reuses the view's bridge
-    dispatcher and kind, so reviewer/overview pycmd() handlers keep
-    working after the swap. The old page (and with it the render widget
-    host / compositor frame sink holding the IOSurfaces) is deleted.
+    Confirmed insufficient to stop the leak; kept for comparison.
     """
+    from aqt import colors
+    from aqt.theme import theme_manager
+
     old = web.page()
     new = AnkiWebPage(web._onBridgeCmd, web._kind, web)
     new.setBackgroundColor(theme_manager.qcolor(colors.CANVAS))
     new.open_links_externally = old.open_links_externally
     new.setZoomFactor(old.zoomFactor())
     web.setPage(new)
-    # the swap creates a new focus proxy; force the event filter to be
-    # reinstalled on it by the next bridge command
     web._filterSet = False
+    old.deleteLater()
+
+
+def recycle_view(attr: str) -> None:
+    """Destroy the whole QWebEngineView named `attr` on mw (mw.web or
+    mw.bottomWeb) and replace it with a fresh instance in the same layout
+    slot, updating every cached reference to it.
+    """
+    old = getattr(mw, attr)
+    layout = mw.mainLayout
+    index = layout.indexOf(old)
+    new = type(old)(mw)  # MainWebView(mw) or BottomWebView(mw)
+
+    layout.removeWidget(old)
+    layout.insertWidget(index, new)
+    setattr(mw, attr, new)
+
+    if attr == "web":
+        new.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        new.setMinimumWidth(400)
+        new.setAcceptDrops(True)
+        mw.reviewer.web = new
+        mw.overview.web = new
+        mw.deckBrowser.web = new
+    else:  # bottomWeb
+        new.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        new.disable_zoom()
+        new.requiresCol = False
+        mw.reviewer.bottom.web = new
+        mw.overview.bottom.web = new
+
+    old.setParent(None)
     old.deleteLater()
 
 
@@ -78,17 +118,16 @@ def step() -> None:
     if remaining <= 0:
         print("after:", iosurface())
         timer.stop()
-        # deleteLater()-ed pages and their GPU resources are torn down
-        # asynchronously; measure again once that has settled
+        # deleteLater()-ed views/pages and their GPU resources are torn
+        # down asynchronously; measure again once that has settled
         QTimer.singleShot(3000, lambda: print("after 40 toggles:", iosurface()))
         return
-    if RECYCLE_PAGES:
-        # both of these webviews navigate on every state change; give each
-        # a fresh page so the old one's compositor surfaces can be freed.
-        # moveToState() below re-renders them, so the blank page is only
-        # visible for a frame.
+    if MODE == "recycle_page":
         recycle_page(mw.web)
         recycle_page(mw.bottomWeb)
+    elif MODE == "recycle_view":
+        recycle_view("web")
+        recycle_view("bottomWeb")
     mw.moveToState("review" if mw.state == "overview" else "overview")
     remaining -= 1
 
