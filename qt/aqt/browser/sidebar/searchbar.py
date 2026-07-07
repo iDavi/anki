@@ -23,7 +23,10 @@ class SidebarSearchBar(QLineEdit):
         qconnect(self.textChanged, self.onTextChanged)
 
     def onTextChanged(self, text: str) -> None:
-        if not self.timer.isActive():
+        if not text.strip():
+            self.timer.stop()
+            self.sidebar.search_for("")
+        elif not self.timer.isActive():
             self.timer.start()
 
     def onSearch(self) -> None:
