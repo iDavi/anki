@@ -82,6 +82,7 @@ class SidebarTreeView(QTreeView):
         self.current_search: str | None = None
         self.valid_drop_types: tuple[SidebarItemType, ...] = ()
         self._refresh_needed = False
+        self._auto_expanding = False
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.onContextMenu)  # type: ignore
@@ -227,14 +228,23 @@ class SidebarTreeView(QTreeView):
         self.showColumn(0)
         if not text.strip():
             self.current_search = None
-            self.refresh()
+            self._auto_expanding = True
+            try:
+                self.collapseAll()
+                self._expand_where_necessary(self.model())
+            finally:
+                self._auto_expanding = False
             return
 
         self.current_search = text
-        # start from a collapsed state, as it's faster
-        self.collapseAll()
-        self.setColumnHidden(0, not self.model().search(text))
-        self._expand_where_necessary(self.model(), searching=True)
+        self._auto_expanding = True
+        try:
+            # start from a collapsed state, as it's faster
+            self.collapseAll()
+            self.setColumnHidden(0, not self.model().search(text))
+            self._expand_where_necessary(self.model(), searching=True)
+        finally:
+            self._auto_expanding = False
 
     def _expand_where_necessary(
         self,
@@ -490,13 +500,13 @@ class SidebarTreeView(QTreeView):
             self.remove_tags(item)
 
     def _on_expansion(self, idx: QModelIndex) -> None:
-        if self.current_search:
+        if self._auto_expanding:
             return
         if item := self.model().item_for_index(idx):
             item.expanded = True
 
     def _on_collapse(self, idx: QModelIndex) -> None:
-        if self.current_search:
+        if self._auto_expanding:
             return
         if item := self.model().item_for_index(idx):
             item.expanded = False
